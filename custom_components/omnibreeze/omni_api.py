@@ -103,6 +103,10 @@ class OmniBreezeAPI:
                 cmd_id = struct.unpack('>H', data[7:9])[0]
                 if cmd_id == 0x7035:
                     self.is_connected = True
+                    # Request initial status
+                    self.writer.write(self._create_packet(0x7038))
+                    await self.writer.drain()
+                    
                     asyncio.create_task(self._listen())
                     asyncio.create_task(self._heartbeat())
                     return True
@@ -111,25 +115,41 @@ class OmniBreezeAPI:
         return False
 
     async def _listen(self):
-        while self.is_connected:
+        while True:
             try:
                 data = await self.reader.read(1024)
-                if not data: break
+                if not data:
+                    _LOGGER.warning("Connection lost to %s, reconnecting...", self.ip)
+                    break
+                
+                # Process data
                 if data.startswith(b'\xaa\xaa'):
-                    length = struct.unpack('>H', data[2:4])[0]
-                    cmd_id = struct.unpack('>H', data[7:9])[0]
-                    payload = data[9:length+4]
-                    
-                    if cmd_id == 0x7039: # Status update
+                    # Handle multiple packets in one read
+                    while data.startswith(b'\xaa\xaa'):
+                        try:
+                            length = struct.unpack('>H', data[2:4])[0]
+                            cmd_id = struct.unpack('>H', data[7:9])[0]
+                            payload = data[9:length+4]
+                            
+                    # 0x7036 is the response/update from the fan
+                    if cmd_id == 0x7036:
                         cipher = AES.new(self.raw_key, AES.MODE_CBC, iv=self.nonce.encode('utf-8'))
                         decrypted = unpad(cipher.decrypt(payload), 16)
                         ttlv = self._parse_ttlv(decrypted)
                         if self.on_state_update:
                             self.on_state_update(ttlv)
+                            
+                            data = data[length+4:]
+                        except Exception as e:
+                            _LOGGER.error("Packet processing error: %s", e)
+                            break
             except Exception as e:
                 _LOGGER.error("Listen error: %s", e)
                 break
+        
         self.is_connected = False
+        await asyncio.sleep(5)
+        asyncio.create_task(self.connect())
 
     async def _heartbeat(self):
         while self.is_connected:
@@ -142,7 +162,8 @@ class OmniBreezeAPI:
     async def send_command(self, dp_id, dp_type, value):
         if not self.is_connected: return False
         cmd_data = self._build_ttlv(dp_id, dp_type, value)
-        packet = self._create_packet(0x7036, cmd_data, encrypt=True)
+        # 0x7039 is the write command (Control Request)
+        packet = self._create_packet(0x7039, cmd_data, encrypt=True)
         self.writer.write(packet)
         await self.writer.drain()
         return True
