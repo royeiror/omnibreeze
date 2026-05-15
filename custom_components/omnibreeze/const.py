@@ -2,8 +2,8 @@ DOMAIN = "omnibreeze"
 CONF_IP = "ip"
 CONF_AUTH_KEY = "auth_key"
 
-DP_TEMP = 1
-DP_POWER = 2
+DP_TEMP = 256
+DP_POWER = 576
 DP_OSCILLATION = 257
 DP_SPEED = 258
 DP_MODE = 259

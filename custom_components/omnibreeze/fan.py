@@ -21,7 +21,12 @@ async def async_setup_entry(hass, entry, async_add_entities):
     api = OmniBreezeAPI(ip, 6607, auth_key)
     fan = OmniBreezeFanEntity(api, name, entry.entry_id)
     async_add_entities([fan])
-    await api.connect()
+    
+    # Try login
+    if await api.async_login():
+        _LOGGER.info("Successfully connected to OmniBreeze fan at %s", ip)
+    else:
+        _LOGGER.error("Failed to connect to OmniBreeze fan at %s", ip)
 
 class OmniBreezeFanEntity(FanEntity):
     def __init__(self, api, name, entry_id):
@@ -54,6 +59,7 @@ class OmniBreezeFanEntity(FanEntity):
         return FanEntityFeature.SET_SPEED | FanEntityFeature.OSCILLATE | FanEntityFeature.TURN_ON | FanEntityFeature.TURN_OFF
 
     def _handle_state_update(self, ttlv):
+        _LOGGER.debug("State update received: %s", ttlv)
         for tid, val in ttlv:
             if tid == DP_POWER:
                 self._state = bool(val)
@@ -66,14 +72,14 @@ class OmniBreezeFanEntity(FanEntity):
         self.async_write_ha_state()
 
     async def async_turn_on(self, percentage=None, preset_mode=None, **kwargs):
-        await self._api.send_command(DP_POWER, 2, 1) # Type 2 (Int), Value 1 (ON)
+        await self._api.async_set_power(True)
         if percentage:
             await self.async_set_percentage(percentage)
         self._state = True
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs):
-        await self._api.send_command(DP_POWER, 2, 0) # Type 2 (Int), Value 0 (OFF)
+        await self._api.async_set_power(False)
         self._state = False
         self.async_write_ha_state()
 
@@ -82,11 +88,11 @@ class OmniBreezeFanEntity(FanEntity):
             await self.async_turn_off()
             return
         speed = int(percentage_to_ordered_list_item(ORDERED_NAMED_FAN_SPEEDS, percentage))
-        await self._api.send_command(DP_SPEED, 2, speed)
+        await self._api.async_set_speed(speed)
         self._percentage = percentage
         self.async_write_ha_state()
 
     async def async_oscillate(self, oscillating):
-        await self._api.send_command(DP_OSCILLATION, 1 if oscillating else 0, oscillating)
+        await self._api.async_set_oscillation(oscillating)
         self._oscillating = oscillating
         self.async_write_ha_state()

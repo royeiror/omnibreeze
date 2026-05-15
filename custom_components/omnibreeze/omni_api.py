@@ -29,13 +29,14 @@ class OmniBreezeAPI:
             cipher = AES.new(self.raw_key, AES.MODE_CBC, iv=self.nonce.encode('utf-8'))
             payload = cipher.encrypt(pad(payload, 16))
 
-        length = len(payload) + 5
-        header = b'\xaa\xaa'
         packet_id_bytes = struct.pack('>H', self.packet_id)
         cmd_id_bytes = struct.pack('>H', cmd_id)
+        length = len(payload) + 5
+        header = b'\xaa\xaa' + struct.pack('>H', length)
         checksum_data = packet_id_bytes + cmd_id_bytes + payload
         checksum = self._calc_checksum(checksum_data)
-        full_packet = header + struct.pack('>H', length) + bytes([checksum]) + checksum_data
+        
+        full_packet = header + struct.pack('B', checksum) + packet_id_bytes + cmd_id_bytes + payload
         self.packet_id = (self.packet_id + 1) & 0xFFFF
         return full_packet
 
@@ -57,120 +58,134 @@ class OmniBreezeAPI:
                 results.append((tag_id, value))
             elif tag_type == 2:
                 if i + 2 > len(data): break
-                value = struct.unpack('>H', data[i:i+2])[0]
-                i += 2
-                results.append((tag_id, value))
+                # Handle variable length int
+                length_prefix = data[i]
+                i += 1
+                value_bytes = data[i:i+length_prefix+1]
+                i += length_prefix + 1
+                val = int.from_bytes(value_bytes, 'big')
+                results.append((tag_id, val))
             elif tag_type == 1: results.append((tag_id, True))
             elif tag_type == 0: results.append((tag_id, False))
             else: break
         return results
 
-    def _build_ttlv(self, tag_id, tag_type, value):
-        header = ((tag_id & 0x1FFF) << 3) | (tag_type & 0x07)
-        data = struct.pack('>H', header)
-        if tag_type in [3, 5]:
-            if isinstance(value, str): value = value.encode('utf-8')
-            data += struct.pack('>H', len(value)) + value
-        elif tag_type == 2:
-            data += struct.pack('>H', value)
-        return data
+    def _build_int_payload(self, val):
+        if val == 0: return b'\x00\x00'
+        b = struct.pack('>Q', val)
+        for i in range(8):
+            if b[i] != 0:
+                data = b[i:]
+                return struct.pack('B', len(data) - 1) + data
+        return b'\x00\x00'
 
-    async def connect(self):
+    async def _send_magic_token(self):
+        # The magic token found in PCAP (28 bytes)
+        token_hex = "2aae26c2be5b12998a3bba3fbf09d76773d274386ceb349e4dd3f6f6"
+        token = bytes.fromhex(token_hex)
+        header = struct.pack('>H', (502 << 3) | 3) # Tag 502, Type 3 (Bytes)
+        payload = header + struct.pack('>H', len(token)) + token
+        packet = self._create_packet(0x0011, payload)
+        self.writer.write(packet)
+        await self.writer.drain()
+
+    async def _request_info(self):
+        # 0x0013 requests full state from fan
+        packet = self._create_packet(0x0013)
+        self.writer.write(packet)
+        await self.writer.drain()
+
+    async def async_login(self):
+        """Perform the full handshake and login."""
         try:
-            self.reader, self.writer = await asyncio.open_connection(self.ip, self.port)
+            self.reader, self.writer = await asyncio.open_connection(self.ip, 6607)
+            
+            # 1. Hello
             self.writer.write(self._create_packet(0x7032))
             await self.writer.drain()
             
-            data = await self.reader.read(1024)
-            if data.startswith(b'\xaa\xaa'):
-                cmd_id = struct.unpack('>H', data[7:9])[0]
-                if cmd_id == 0x7033:
-                    ttlv = self._parse_ttlv(data[9:])
-                    for tid, val in ttlv:
-                        if tid == 1:
-                            self.nonce = val.decode('utf-8')
-                            _LOGGER.info("Received nonce from %s: %s", self.ip, self.nonce)
-
-            if not self.nonce: 
-                _LOGGER.error("Failed to get nonce from %s", self.ip)
+            # 2. Receive Nonce
+            data = await asyncio.wait_for(self.reader.read(1024), timeout=5.0)
+            if not data.startswith(b'\xaa\xaa'):
                 return False
-
-            login_str = f"{self.hex_key};{self.nonce}"
+            cmd_id = struct.unpack('>H', data[7:9])[0]
+            if cmd_id != 0x7033:
+                return False
+            self.nonce = data[13:29].decode('utf-8')
+            
+            # 3. Login
+            login_str = f"{self.hex_key.upper()};{self.nonce}"
             login_hash = hashlib.sha256(login_str.encode('utf-8')).hexdigest()
-            login_payload = self._build_ttlv(2, 3, login_hash)
-            self.writer.write(self._create_packet(0x7034, login_payload))
+            header = struct.pack('>H', (2 << 3) | 3)
+            payload = header + struct.pack('>H', len(login_hash)) + login_hash.encode('utf-8')
+            self.writer.write(self._create_packet(0x7034, payload))
             await self.writer.drain()
             
-            data = await self.reader.read(1024)
-            if data.startswith(b'\xaa\xaa'):
-                cmd_id = struct.unpack('>H', data[7:9])[0]
-                if cmd_id == 0x7035:
-                    _LOGGER.info("Login successful for %s", self.ip)
-                    self.is_connected = True
-                    # Request initial status
-                    self.writer.write(self._create_packet(0x7038))
-                    await self.writer.drain()
-                    
-                    asyncio.create_task(self._listen())
-                    asyncio.create_task(self._heartbeat())
-                    return True
-                else:
-                    _LOGGER.error("Login failed for %s: Cmd 0x%04x", self.ip, cmd_id)
+            # 4. Success?
+            data = await asyncio.wait_for(self.reader.read(1024), timeout=5.0)
+            if not data.startswith(b'\xaa\xaa'):
+                return False
+            cmd_id = struct.unpack('>H', data[7:9])[0]
+            if cmd_id == 0x7035:
+                self.packet_id = 1
+                self.is_connected = True
+                await self._send_magic_token()
+                await self._request_info()
+                asyncio.create_task(self._listen())
+                asyncio.create_task(self._heartbeat())
+                return True
+            return False
         except Exception as e:
-            _LOGGER.error("Connection error: %s", e)
-        return False
+            _LOGGER.error("[%s] Login failed: %s", self.ip, e)
+            return False
+
+    async def async_set_power(self, state: bool):
+        """Set fan power state."""
+        val = 1 if state else 0
+        payload = struct.pack('>H', (576 << 3) | 2) + self._build_int_payload(val)
+        packet = self._create_packet(0x7039, payload, encrypt=True)
+        self.writer.write(packet)
+        await self.writer.drain()
+
+    async def async_set_oscillation(self, state: bool):
+        """Set fan oscillation state."""
+        header = (257 << 3) | (1 if state else 0)
+        payload = struct.pack('>H', header)
+        packet = self._create_packet(0x7039, payload, encrypt=True)
+        self.writer.write(packet)
+        await self.writer.drain()
+
+    async def async_set_speed(self, speed: int):
+        """Set fan speed (1-12)."""
+        payload = struct.pack('>H', (258 << 3) | 2) + self._build_int_payload(speed)
+        packet = self._create_packet(0x7039, payload, encrypt=True)
+        self.writer.write(packet)
+        await self.writer.drain()
 
     async def _listen(self):
-        while True:
+        while self.is_connected:
             try:
                 data = await self.reader.read(1024)
-                if not data:
-                    _LOGGER.warning("Connection lost to %s, reconnecting...", self.ip)
-                    break
-                
-                # Process data
+                if not data: break
                 if data.startswith(b'\xaa\xaa'):
-                    # Handle multiple packets in one read
-                    while data.startswith(b'\xaa\xaa'):
+                    cmd_id = struct.unpack('>H', data[7:9])[0]
+                    if cmd_id == 0x7036: # Status update
+                        payload = data[9:]
+                        cipher = AES.new(self.raw_key, AES.MODE_CBC, iv=self.nonce.encode('utf-8'))
                         try:
-                            length = struct.unpack('>H', data[2:4])[0]
-                            cmd_id = struct.unpack('>H', data[7:9])[0]
-                            payload = data[9:length+4]
-                            
-                            # 0x7036 is the response/update from the fan
-                            if cmd_id == 0x7036:
-                                cipher = AES.new(self.raw_key, AES.MODE_CBC, iv=self.nonce.encode('utf-8'))
-                                decrypted = unpad(cipher.decrypt(payload), 16)
-                                ttlv = self._parse_ttlv(decrypted)
-                                if self.on_state_update:
-                                    self.on_state_update(ttlv)
-                            
-                            data = data[length+4:]
-                        except Exception as e:
-                            _LOGGER.error("Packet processing error: %s", e)
-                            break
-            except Exception as e:
-                _LOGGER.error("Listen error: %s", e)
-                break
-        
+                            decrypted = unpad(cipher.decrypt(payload), 16)
+                            ttlv = self._parse_ttlv(decrypted)
+                            if self.on_state_update:
+                                self.on_state_update(ttlv)
+                        except: pass
+            except: break
         self.is_connected = False
-        await asyncio.sleep(5)
-        asyncio.create_task(self.connect())
 
     async def _heartbeat(self):
         while self.is_connected:
             try:
-                self.writer.write(self._create_packet(0x7037))
+                # Heartbeat 0x7037 should be encrypted empty payload
+                self.writer.write(self._create_packet(0x7037, encrypt=True))
                 await self.writer.drain()
                 await asyncio.sleep(10)
             except: break
-
-    async def send_command(self, dp_id, dp_type, value):
-        if not self.is_connected: return False
-        _LOGGER.info("Sending command to %s: DP %s (%s) = %s", self.ip, dp_id, dp_type, value)
-        cmd_data = self._build_ttlv(dp_id, dp_type, value)
-        # 0x7039 is the write command (Control Request)
-        packet = self._create_packet(0x7039, cmd_data, encrypt=True)
-        self.writer.write(packet)
-        await self.writer.drain()
-        return True
