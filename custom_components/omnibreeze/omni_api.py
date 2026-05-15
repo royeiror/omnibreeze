@@ -89,8 +89,11 @@ class OmniBreezeAPI:
                     for tid, val in ttlv:
                         if tid == 1:
                             self.nonce = val.decode('utf-8')
+                            _LOGGER.info("Received nonce from %s: %s", self.ip, self.nonce)
 
-            if not self.nonce: return False
+            if not self.nonce: 
+                _LOGGER.error("Failed to get nonce from %s", self.ip)
+                return False
 
             login_str = f"{self.hex_key};{self.nonce}"
             login_hash = hashlib.sha256(login_str.encode('utf-8')).hexdigest()
@@ -102,6 +105,7 @@ class OmniBreezeAPI:
             if data.startswith(b'\xaa\xaa'):
                 cmd_id = struct.unpack('>H', data[7:9])[0]
                 if cmd_id == 0x7035:
+                    _LOGGER.info("Login successful for %s", self.ip)
                     self.is_connected = True
                     # Request initial status
                     self.writer.write(self._create_packet(0x7038))
@@ -110,6 +114,8 @@ class OmniBreezeAPI:
                     asyncio.create_task(self._listen())
                     asyncio.create_task(self._heartbeat())
                     return True
+                else:
+                    _LOGGER.error("Login failed for %s: Cmd 0x%04x", self.ip, cmd_id)
         except Exception as e:
             _LOGGER.error("Connection error: %s", e)
         return False
@@ -161,6 +167,7 @@ class OmniBreezeAPI:
 
     async def send_command(self, dp_id, dp_type, value):
         if not self.is_connected: return False
+        _LOGGER.info("Sending command to %s: DP %s (%s) = %s", self.ip, dp_id, dp_type, value)
         cmd_data = self._build_ttlv(dp_id, dp_type, value)
         # 0x7039 is the write command (Control Request)
         packet = self._create_packet(0x7039, cmd_data, encrypt=True)

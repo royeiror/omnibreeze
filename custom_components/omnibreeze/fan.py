@@ -66,14 +66,14 @@ class OmniBreezeFanEntity(FanEntity):
         self.async_write_ha_state()
 
     async def async_turn_on(self, percentage=None, preset_mode=None, **kwargs):
-        await self._api.send_command(DP_POWER, 1, True) # 1 for True
+        await self._api.send_command(DP_POWER, 2, 1) # Type 2 (Int), Value 1 (ON)
         if percentage:
             await self.async_set_percentage(percentage)
         self._state = True
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs):
-        await self._api.send_command(DP_POWER, 0, False) # 0 for False
+        await self._api.send_command(DP_POWER, 2, 0) # Type 2 (Int), Value 0 (OFF)
         self._state = False
         self.async_write_ha_state()
 
