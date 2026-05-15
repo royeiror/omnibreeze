@@ -131,13 +131,13 @@ class OmniBreezeAPI:
                             cmd_id = struct.unpack('>H', data[7:9])[0]
                             payload = data[9:length+4]
                             
-                    # 0x7036 is the response/update from the fan
-                    if cmd_id == 0x7036:
-                        cipher = AES.new(self.raw_key, AES.MODE_CBC, iv=self.nonce.encode('utf-8'))
-                        decrypted = unpad(cipher.decrypt(payload), 16)
-                        ttlv = self._parse_ttlv(decrypted)
-                        if self.on_state_update:
-                            self.on_state_update(ttlv)
+                            # 0x7036 is the response/update from the fan
+                            if cmd_id == 0x7036:
+                                cipher = AES.new(self.raw_key, AES.MODE_CBC, iv=self.nonce.encode('utf-8'))
+                                decrypted = unpad(cipher.decrypt(payload), 16)
+                                ttlv = self._parse_ttlv(decrypted)
+                                if self.on_state_update:
+                                    self.on_state_update(ttlv)
                             
                             data = data[length+4:]
                         except Exception as e:
